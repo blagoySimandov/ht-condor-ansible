@@ -1,0 +1,267 @@
+- name: Install HTCondor on all nodes
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Install Initial dependencies
+      apt:
+        name: [curl, gnupg]
+        update_cache: yes
+
+    - name: Add HTCondor apt key
+      shell: |
+        curl -fsSL https://htcss-downloads.chtc.wisc.edu/repo/keys/HTCondor-24.0-Key | \
+          gpg --dearmor -o /usr/share/keyrings/htcondor.gpg
+      args:
+        creates: /usr/share/keyrings/htcondor.gpg
+
+    - name: Remove broken HTCondor repo if exists
+      file:
+        path: /etc/apt/sources.list.d/htcss_downloads_chtc_wisc_edu_repo_ubuntu_24_0.list
+        state: absent
+
+    - name: Add HTCondor repo
+      copy:
+        dest: /etc/apt/sources.list.d/htcondor.list
+        content: "deb [signed-by=/usr/share/keyrings/htcondor.gpg] https://htcss-downloads.chtc.wisc.edu/repo/ubuntu/24.0 noble main\n"
+
+    - name: Install HTCondor
+      apt:
+        name: htcondor
+        update_cache: yes
+
+- name: Configure master (central manager)
+  hosts: master
+  become: yes
+  tasks:
+    - name: Set condor config
+      copy:
+        dest: /etc/condor/condor_config.local
+        content: |
+          CONDOR_HOST = {{ ansible_host }}
+          DAEMON_LIST = MASTER, COLLECTOR, NEGOTIATOR, SCHEDD
+          ALLOW_WRITE = *
+          ALLOW_READ = *
+          ALLOW_ADMINISTRATOR = *
+          ALLOW_NEGOTIATOR = *
+          ALLOW_DAEMON = *
+          SEC_DEFAULT_AUTHENTICATION = OPTIONAL
+          SEC_DEFAULT_AUTHENTICATION_METHODS = FS,PASSWORD,ANONYMOUS
+          ENABLE_WEBSERVER = TRUE
+          WEBSERVER_PORT = 8080
+
+    - name: Start condor
+      service:
+        name: condor
+        state: restarted
+        enabled: yes
+
+- name: Configure workers
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Set condor config
+      copy:
+        dest: /etc/condor/condor_config.local
+        content: |
+          CONDOR_HOST = 10.172.13.20
+          DAEMON_LIST = MASTER, STARTD
+          ALLOW_WRITE = *
+          ALLOW_READ = *
+          ALLOW_ADMINISTRATOR = *
+          ALLOW_NEGOTIATOR = *
+          ALLOW_DAEMON = *
+          SEC_DEFAULT_AUTHENTICATION = OPTIONAL
+          SEC_DEFAULT_AUTHENTICATION_METHODS = FS,PASSWORD,ANONYMOUS
+
+    - name: Start condor
+      service:
+        name: condor
+        state: restarted
+        enabled: yes
+
+- name: Setup node_exporter on all nodes
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Download node_exporter
+      get_url:
+        url: https://github.com/prometheus/node_exporter/releases/download/v1.8.0/node_exporter-1.8.0.linux-amd64.tar.gz
+        dest: /tmp/node_exporter.tar.gz
+
+    - name: Extract node_exporter
+      unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Install node_exporter binary
+      copy:
+        src: /tmp/node_exporter-1.8.0.linux-amd64/node_exporter
+        dest: /usr/local/bin/node_exporter
+        mode: '0755'
+        remote_src: yes
+
+    - name: Create node_exporter user
+      user:
+        name: node_exporter
+        system: yes
+        shell: /bin/false
+        create_home: no
+
+    - name: Create textfile collector dir
+      file:
+        path: /var/lib/node_exporter/textfile_collector
+        state: directory
+        owner: node_exporter
+        group: node_exporter
+
+    - name: Create node_exporter systemd service
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Node Exporter
+          After=network.target
+
+          [Service]
+          User=node_exporter
+          ExecStart=/usr/local/bin/node_exporter --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Start and enable node_exporter
+      service:
+        name: node_exporter
+        state: started
+        enabled: yes
+
+- name: Setup Prometheus and Grafana on master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Install dependencies
+      apt:
+        name: [wget, tar]
+        update_cache: yes
+
+    - name: Create scripts dir
+      file:
+        path: /scripts
+        state: directory
+
+    - name: Create condor metrics script
+      copy:
+        dest: /scripts/condor_node_exporter.sh
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          CE=$(hostname)
+
+          condor_q -tot \
+          -format "# TYPE condor_queue_removed counter\ncondor_queue_removed{ce=\"$CE\"} %d\n" removed \
+          -format "# TYPE condor_queue_idle counter\ncondor_queue_idle{ce=\"$CE\"} %d\n" idle \
+          -format "# TYPE condor_queue_running counter\ncondor_queue_running{ce=\"$CE\"} %d\n" running \
+          -format "# TYPE condor_queue_held counter\ncondor_queue_held{ce=\"$CE\"} %d\n" held \
+          -format "# TYPE condor_queue_suspended counter\ncondor_queue_suspended{ce=\"$CE\"} %d" suspended \
+          > /var/lib/node_exporter/textfile_collector/condor.queue.prom.$$
+          mv /var/lib/node_exporter/textfile_collector/condor.queue.prom.$$ \
+             /var/lib/node_exporter/textfile_collector/condor.queue.prom
+
+          condor_status -tot \
+          |sed '$!d' \
+          |awk '{print "# TYPE condor_status_machines counter\ncondor_status_machines{ce=ceinfo} " $2 "\n# TYPE condor_status_claimed counter\ncondor_status_claimed{ce=ceinfo} " $4 "\n# TYPE condor_status_unclaimed counter\ncondor_status_unclaimed{ce=ceinfo} " $5}' \
+          > /var/lib/node_exporter/textfile_collector/condor.status.prom.$$
+          sed -i "s/ceinfo/\"$CE\"/g" /var/lib/node_exporter/textfile_collector/condor.status.prom.$$
+          mv /var/lib/node_exporter/textfile_collector/condor.status.prom.$$ \
+             /var/lib/node_exporter/textfile_collector/condor.status.prom
+
+    - name: Setup cron for condor metrics
+      cron:
+        name: condor_metrics
+        minute: "*/5"
+        job: /scripts/condor_node_exporter.sh
+
+    - name: Download Prometheus
+      get_url:
+        url: https://github.com/prometheus/prometheus/releases/download/v2.51.0/prometheus-2.51.0.linux-amd64.tar.gz
+        dest: /tmp/prometheus.tar.gz
+
+    - name: Extract Prometheus
+      unarchive:
+        src: /tmp/prometheus.tar.gz
+        dest: /opt/
+        remote_src: yes
+
+    - name: Symlink Prometheus
+      file:
+        src: /opt/prometheus-2.51.0.linux-amd64
+        dest: /opt/prometheus
+        state: link
+        force: yes
+
+    - name: Create Prometheus config
+      copy:
+        dest: /opt/prometheus/prometheus.yml
+        content: |
+          global:
+            scrape_interval: 15s
+
+          scrape_configs:
+            - job_name: 'node'
+              static_configs:
+                - targets: {{ groups['cluster'] | map('extract', hostvars, ['ansible_host']) | map('regex_replace', '$', ':9100') | list | to_json }}
+
+            - job_name: 'htcondor'
+              static_configs:
+                - targets: {{ groups['master'] | map('extract', hostvars, ['ansible_host']) | map('regex_replace', '$', ':9100') | list | to_json }}
+
+    - name: Create Prometheus systemd service
+      copy:
+        dest: /etc/systemd/system/prometheus.service
+        content: |
+          [Unit]
+          Description=Prometheus
+          After=network.target
+
+          [Service]
+          ExecStart=/opt/prometheus/prometheus --config.file=/opt/prometheus/prometheus.yml --storage.tsdb.path=/opt/prometheus/data
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Add Grafana GPG key
+      shell: |
+        wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key
+      args:
+        creates: /usr/share/keyrings/grafana.key
+
+    - name: Add Grafana repo
+      copy:
+        dest: /etc/apt/sources.list.d/grafana.list
+        content: "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main\n"
+
+    - name: Install Grafana
+      apt:
+        name: grafana
+        update_cache: yes
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Start and enable services
+      service:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - node_exporter
+        - prometheus
+        - grafana-server

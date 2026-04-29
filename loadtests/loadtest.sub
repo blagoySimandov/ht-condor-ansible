@@ -1,0 +1,11 @@
+initialdir = .
+executable = primes.sh
+arguments  = 2000000
+output     = logs/primes_$(Cluster)_$(Process).out
+error      = logs/primes_$(Cluster)_$(Process).err
+log        = logs/loadtest.log
+
+request_cpus   = 1
+request_memory = 512MB
+
+queue 12
