@@ -1,0 +1,4 @@
+JOB CPU_SINGLE  cpu_single.submit
+JOB CPU_PAR     cpu_parallel.submit
+JOB MEMORY      memory.submit
+JOB IO          io.submit

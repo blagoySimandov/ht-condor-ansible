@@ -1,0 +1,11 @@
+executable = cpu_single.py
+arguments  =
+output     = output/cpu_single_job_$(Cluster)_$(Process)_$(Machine).out
+error      = err/cpu_single_job_$(Cluster)_$(Process)_$(Machine).err
+log        = logs/cpu_single.log
+
+request_cpus = 1
+request_memory = 512MB
+transfer_input_files = scripts/
+
+queue 36
